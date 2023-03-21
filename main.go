@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
 	"lnj.com/unix/sockets/list"
@@ -29,6 +30,8 @@ type Config struct {
 	ConnIn    net.Conn
 	Queue     list.DListNode
 	ReadCount int
+	ShutDown  bool
+	AppMutex  sync.Mutex
 }
 
 func main() {
@@ -57,9 +60,13 @@ func main() {
 
 	go func() {
 		<-quit
+
+		//app.AppMutex.Lock()
+		app.ShutDown = true
+		//app.AppMutex.Unlock()
+
 		fmt.Println("ctrl-c pressed!")
 		close(quit)
-		os.Exit(0)
 	}()
 
 	go app.handleQueuedMessages()
@@ -77,26 +84,42 @@ func main() {
 
 func (app *Config) handleQueuedMessages() {
 
-	for {
-		if !app.Queue.IsEmpty() {
+	var state string = "start"
+	var ok bool
+	var msg *message.Transport
 
-			fmt.Println("QC:", app.Queue.GetNodeCount())
-			ok, m := app.Queue.Take()
-			if ok {
-				// represents 100 millisecond work on each message plus print time
-				time.Sleep(time.Millisecond * 100)
-				s := string(m.Data)
-				fmt.Println("s:", s)
+	for {
+
+		switch state {
+		case "start":
+			if !app.Queue.IsEmpty() {
+				//fmt.Println("QC:", app.Queue.GetNodeCount())
+				app.AppMutex.Lock()
+				ok, msg = app.Queue.Take()
+				app.AppMutex.Unlock()
+				if ok {
+					// do some small work
+					time.Sleep(time.Millisecond * 5)
+					s := string(msg.Data)
+					fmt.Println("s:", s)
+				}
+			} else {
+				if app.ShutDown {
+					fmt.Println("sleep 1 for shutdown race")
+					time.Sleep(time.Second * 1)
+					fmt.Println("write shutdown")
+					os.Exit(0)
+				}
+				fmt.Println("RC=", app.ReadCount)
+				time.Sleep(time.Second * 5)
 			}
-		} else {
-			fmt.Println("Q sleep, MessageCount=", app.ReadCount)
-			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
 func (app *Config) readInput() {
 	defer app.ConnIn.Close()
+
 	m := &message.Transport{}
 	err := m.Read(app.ConnIn)
 	if err != nil {
@@ -104,5 +127,31 @@ func (app *Config) readInput() {
 		return
 	}
 	app.ReadCount += 1
+	app.AppMutex.Lock()
 	app.Queue.PriorityPut(m, 0)
+	app.AppMutex.Unlock()
+
+	if app.ShutDown {
+		fmt.Println("read shutdown signal")
+		mb := &message.Transport{}
+		msg := "hold-messages"
+		mb.Length = len(msg)
+		mb.Data = []byte(msg)
+		err = mb.Write(app.ConnIn)
+		if err != nil {
+			log.Println(err)
+		}
+		app.ConnIn.Close()
+	} else {
+		mb := &message.Transport{}
+		msg := "ok"
+		mb.Length = len(msg)
+		mb.Data = []byte(msg)
+		err = mb.Write(app.ConnIn)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+	}
+
 }
